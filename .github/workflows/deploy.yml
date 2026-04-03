@@ -1,0 +1,87 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy (commit SHA). Leave empty to use current commit.'
+        required: false
+        default: ''
+        type: string
+      skip_build:
+        description: 'Skip build and only deploy'
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  REGISTRY: crpi-hrity7yofv004168.cn-shanghai.personal.cr.aliyuncs.com
+  IMAGE: crpi-hrity7yofv004168.cn-shanghai.personal.cr.aliyuncs.com/15150276667/rttys
+
+jobs:
+  build:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_build == true) }}
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ github.sha }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Login to Aliyun ACR
+        run: echo "${{ secrets.ACR_PASSWORD }}" | docker login ${{ env.REGISTRY }} -u "${{ secrets.ACR_USERNAME }}" --password-stdin
+
+      - name: Build Docker image
+        run: docker build -t ${{ env.IMAGE }}:${{ github.sha }} .
+
+      - name: Push Docker image
+        run: docker push ${{ env.IMAGE }}:${{ github.sha }}
+
+  deploy:
+    needs: build
+    if: ${{ !cancelled() && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout helms repo
+        uses: actions/checkout@v5
+        with:
+          repository: xjxkeep/helms
+          token: ${{ secrets.GH_PAT }}
+          path: helms
+
+      - name: Copy helm chart to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          source: "helms/rttys"
+          target: /root/
+
+      - name: Resolve image tag
+        id: resolve-tag
+        run: |
+          TAG="${{ inputs.image_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="${{ github.sha }}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Deploying image tag: ${TAG}"
+
+      - name: Deploy to server via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          script: |
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+            helm upgrade --install rttys /root/helms/rttys/ \
+              --set image.tag=${{ steps.resolve-tag.outputs.tag }} \
+              --set imagePullSecret.username="${{ secrets.ACR_USERNAME }}" \
+              --set imagePullSecret.password="${{ secrets.ACR_PASSWORD }}" \
+              --set rttys.password="${{ secrets.RTTYS_PASSWORD }}" \
+              --set rttys.token="${{ secrets.RTTYS_TOKEN }}" \
+              --wait --timeout 120s
