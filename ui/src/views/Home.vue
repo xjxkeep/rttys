@@ -35,7 +35,7 @@
           <el-table-column width="100">
             <template #default="{ row }">
               <el-space size="large">
-                <el-icon size="25" color="black" style="cursor:pointer;" @click="connectDevice(row.id)"><TerminalIcon /></el-icon>
+                <el-icon size="25" color="black" style="cursor:pointer;" @click="connectDevice(row.id, row.group)"><TerminalIcon /></el-icon>
                 <el-icon size="25" color="#409EFF" style="cursor:pointer;" @click="connectDeviceWeb(row)"><IEIcon /></el-icon>
               </el-space>
             </template>
@@ -160,10 +160,11 @@ const handleRefresh = () => {
 
 const handleSelection = (sel) => selection.value = sel
 
-const connectDevice = (devid) => {
+const connectDevice = (devid, devGroup) => {
   let url = `/rtty/${devid}`
-  if (group.value)
-    url += `?group=${group.value}`
+  const g = devGroup || group.value
+  if (g)
+    url += `?group=${g}`
   window.open(url)
 }
 

@@ -66,27 +66,16 @@ func (srv *RttyServer) GetDevice(group, id string) *Device {
 	srv.mu.RLock()
 	defer srv.mu.RUnlock()
 
-	if group != "" {
-		g := srv.GetGroup(group, false)
-		if g == nil {
-			return nil
-		}
-		if v, ok := g.devices.Load(id); ok {
-			return v.(*Device)
-		}
+	g := srv.GetGroup(group, false)
+	if g == nil {
 		return nil
 	}
 
-	// group is empty: search all groups
-	var found *Device
-	srv.groups.Range(func(key, value any) bool {
-		if v, ok := value.(*DeviceGroup).devices.Load(id); ok {
-			found = v.(*Device)
-			return false
-		}
-		return true
-	})
-	return found
+	if v, ok := g.devices.Load(id); ok {
+		return v.(*Device)
+	}
+
+	return nil
 }
 
 func (srv *RttyServer) AddDevice(dev *Device) bool {
