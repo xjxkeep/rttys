@@ -231,28 +231,36 @@ func (a *APIServer) handleGroups(c *gin.Context) {
 
 func (a *APIServer) handleDevs(c *gin.Context) {
 	devs := make([]*DeviceInfo, 0)
-	g := a.srv.GetGroup(c.Query("group"), false)
 
-	if g == nil {
-		c.JSON(http.StatusOK, devs)
-		return
+	collectDevs := func(g *DeviceGroup) {
+		g.devices.Range(func(key, value any) bool {
+			dev := value.(*Device)
+
+			devs = append(devs, &DeviceInfo{
+				Group:     dev.group,
+				ID:        dev.id,
+				Desc:      dev.desc,
+				Connected: uint32(time.Now().Unix() - dev.timestamp),
+				Uptime:    dev.uptime,
+				Proto:     dev.proto,
+				IPaddr:    dev.conn.RemoteAddr().(*net.TCPAddr).IP.String(),
+			})
+
+			return true
+		})
 	}
 
-	g.devices.Range(func(key, value any) bool {
-		dev := value.(*Device)
-
-		devs = append(devs, &DeviceInfo{
-			Group:     dev.group,
-			ID:        dev.id,
-			Desc:      dev.desc,
-			Connected: uint32(time.Now().Unix() - dev.timestamp),
-			Uptime:    dev.uptime,
-			Proto:     dev.proto,
-			IPaddr:    dev.conn.RemoteAddr().(*net.TCPAddr).IP.String(),
+	group := c.Query("group")
+	if group != "" {
+		if g := a.srv.GetGroup(group, false); g != nil {
+			collectDevs(g)
+		}
+	} else {
+		a.srv.groups.Range(func(key, value any) bool {
+			collectDevs(value.(*DeviceGroup))
+			return true
 		})
-
-		return true
-	})
+	}
 
 	c.JSON(http.StatusOK, devs)
 }
