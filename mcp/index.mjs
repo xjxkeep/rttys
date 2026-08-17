@@ -11,6 +11,11 @@ import { basename } from 'path';
 const MsgTypeFileData = 0x03;
 const ReadFileBlkSize = 63 * 1024;
 const AckBlkSize = 4 * 1024;
+const FileReadyMarker = Buffer.from('\x1eRTTY_FILE_READY\x1f');
+const FilePrepareCommand = "stty -echo; printf '\\036RTTY_FILE_READY\\037'\r";
+const FileReceiveCommand = 'rtty -R\r';
+const FileRestoreCommand = 'stty echo\r';
+const FileHandshakeAttempts = 3;
 
 // --- HTTP helpers ---
 
@@ -163,6 +168,176 @@ function waitForJSONMsg(ws, msgType, timeoutMs = 10000) {
   });
 }
 
+function sendTerminalCommand(ws, command) {
+  ws.send(Buffer.concat([Buffer.from([0]), Buffer.from(command)]));
+}
+
+function waitForTerminalMarker(ws, marker, timeoutMs = 10000) {
+  return new Promise((resolve, reject) => {
+    let unack = 0;
+    let window = Buffer.alloc(0);
+
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error('timeout waiting for terminal readiness'));
+    }, timeoutMs);
+
+    function onMessage(data, isBinary) {
+      if (!isBinary) return;
+
+      const buf = Buffer.from(data);
+      if (buf.length < 2 || buf[0] !== 0) return;
+
+      const payload = buf.subarray(1);
+      unack += payload.length;
+      if (unack > AckBlkSize) {
+        ws.send(JSON.stringify({ type: 'ack', ack: unack }));
+        unack = 0;
+      }
+
+      window = Buffer.concat([window, payload]);
+      if (window.includes(marker)) {
+        cleanup();
+        resolve();
+        return;
+      }
+
+      const keep = Math.max(0, marker.length - 1);
+      if (window.length > keep) window = window.subarray(window.length - keep);
+    }
+
+    function onClose(code) {
+      cleanup();
+      reject(new Error(`connection closed (${code}) while preparing terminal`));
+    }
+
+    function onError(err) {
+      cleanup();
+      reject(err);
+    }
+
+    function cleanup() {
+      clearTimeout(timeout);
+      ws.off('message', onMessage);
+      ws.off('close', onClose);
+      ws.off('error', onError);
+    }
+
+    ws.on('message', onMessage);
+    ws.on('close', onClose);
+    ws.on('error', onError);
+  });
+}
+
+function waitForShellPrompt(ws, timeoutMs = 10000) {
+  return new Promise((resolve, reject) => {
+    let unack = 0;
+    let window = Buffer.alloc(0);
+
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error(`timeout waiting for remote shell (last output: ${JSON.stringify(window.toString())})`));
+    }, timeoutMs);
+
+    function onMessage(data, isBinary) {
+      if (!isBinary) return;
+      const buf = Buffer.from(data);
+      if (buf.length < 2 || buf[0] !== 0) return;
+
+      const payload = buf.subarray(1);
+      unack += payload.length;
+      if (unack > AckBlkSize) {
+        ws.send(JSON.stringify({ type: 'ack', ack: unack }));
+        unack = 0;
+      }
+
+      window = Buffer.concat([window, payload]);
+      const text = window.toString().replace(/[\r\n]+$/, '');
+      if (text.endsWith('# ') || text.endsWith('$ ') || text.endsWith('> ')) {
+        cleanup();
+        resolve();
+        return;
+      }
+      if (window.length > 512) window = window.subarray(window.length - 512);
+    }
+
+    function onClose(code) {
+      cleanup();
+      reject(new Error(`connection closed (${code}) while waiting for remote shell`));
+    }
+
+    function onError(err) {
+      cleanup();
+      reject(err);
+    }
+
+    function cleanup() {
+      clearTimeout(timeout);
+      ws.off('message', onMessage);
+      ws.off('close', onClose);
+      ws.off('error', onError);
+    }
+
+    ws.on('message', onMessage);
+    ws.on('close', onClose);
+    ws.on('error', onError);
+  });
+}
+
+function shellQuote(value) {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+async function prepareFileReceive(client, devid, group) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= FileHandshakeAttempts; attempt++) {
+    let ws;
+    try {
+      ws = await client.connectWS(devid, group);
+      await waitForShellPrompt(ws, 10000);
+      sendTerminalCommand(ws, FilePrepareCommand);
+      await waitForTerminalMarker(ws, FileReadyMarker, 10000);
+      sendTerminalCommand(ws, FileReceiveCommand);
+      await waitForJSONMsg(ws, 'recvfile', 30000);
+      return ws;
+    } catch (err) {
+      lastError = err;
+      ws?.close();
+      if (attempt < FileHandshakeAttempts) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    }
+  }
+
+  throw new Error(`prepare device file receiver after ${FileHandshakeAttempts} attempts: ${lastError?.message || lastError}`);
+}
+
+async function prepareFileSend(client, devid, group, remotePath) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= FileHandshakeAttempts; attempt++) {
+    let ws;
+    try {
+      ws = await client.connectWS(devid, group);
+      await waitForShellPrompt(ws, 10000);
+      sendTerminalCommand(ws, FilePrepareCommand);
+      await waitForTerminalMarker(ws, FileReadyMarker, 10000);
+      sendTerminalCommand(ws, `rtty -S ${shellQuote(remotePath)}\r`);
+      const message = await waitForJSONMsg(ws, 'sendfile', 30000);
+      return { ws, message };
+    } catch (err) {
+      lastError = err;
+      ws?.close();
+      if (attempt < FileHandshakeAttempts) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    }
+  }
+
+  throw new Error(`prepare device file sender after ${FileHandshakeAttempts} attempts: ${lastError?.message || lastError}`);
+}
+
 // --- Upload file (mirrors frontend RttyTerm.vue doUploadFile logic) ---
 
 async function uploadFile(client, devid, group, filePath) {
@@ -171,17 +346,9 @@ async function uploadFile(client, devid, group, filePath) {
     throw new Error('file too large (max 4GB)');
   }
 
-  const ws = await client.connectWS(devid, group);
+  const ws = await prepareFileReceive(client, devid, group);
 
   try {
-    // Step 1: Send "rtty -R" command (same as frontend triggers via terminal)
-    const termCmd = Buffer.from([0, ...Buffer.from('rtty -R\r')]);
-    ws.send(termCmd);
-
-    // Step 2: Wait for "recvfile" (device is ready to receive)
-    await waitForJSONMsg(ws, 'recvfile', 10000);
-
-    // Step 3: Send fileInfo (same as frontend sendFileInfo)
     const fileInfo = JSON.stringify({
       type: 'fileInfo',
       size: stat.size,
@@ -189,14 +356,13 @@ async function uploadFile(client, devid, group, filePath) {
     });
     ws.send(fileInfo);
 
-    // Step 4: Handle zero-size file
     if (stat.size === 0) {
-      // Same as frontend: sendFileData(null) -> [1, MsgTypeFileData]
       ws.send(Buffer.from([1, MsgTypeFileData]));
+      await new Promise(resolve => setTimeout(resolve, 500));
+      sendTerminalCommand(ws, FileRestoreCommand);
       return 0;
     }
 
-    // Step 5: Read and send file in chunks (mirrors frontend fr.onload + fileAck flow)
     const fileData = readFileSync(filePath);
     let offset = 0;
     let sent = 0;
@@ -224,6 +390,7 @@ async function uploadFile(client, devid, group, filePath) {
 
     // Give device time to finish writing before we close
     await new Promise(resolve => setTimeout(resolve, 500));
+    sendTerminalCommand(ws, FileRestoreCommand);
 
     return sent;
   } finally {
@@ -234,15 +401,9 @@ async function uploadFile(client, devid, group, filePath) {
 // --- Download file (mirrors frontend file receive logic) ---
 
 async function downloadFile(client, devid, group, remotePath, outputPath) {
-  const ws = await client.connectWS(devid, group);
+  const { ws, message: sendFileMsg } = await prepareFileSend(client, devid, group, remotePath);
 
   try {
-    // Send "rtty -S <path>" command
-    const termCmd = Buffer.from([0, ...Buffer.from(`rtty -S ${remotePath}\r`)]);
-    ws.send(termCmd);
-
-    // Wait for "sendfile" message with filename
-    const sendFileMsg = await waitForJSONMsg(ws, 'sendfile', 10000);
     const filename = sendFileMsg.name || basename(remotePath);
 
     // Send initial fileAck
@@ -253,6 +414,7 @@ async function downloadFile(client, devid, group, remotePath, outputPath) {
     // Receive file chunks (mirrors frontend binary message handler)
     const chunks = [];
     let received = 0;
+    let terminalUnack = 0;
 
     await new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -265,8 +427,14 @@ async function downloadFile(client, devid, group, remotePath, outputPath) {
         const buf = Buffer.from(data);
         if (buf.length === 0) return;
 
-        // Terminal data (type 0), ignore
-        if (buf[0] === 0) return;
+        if (buf[0] === 0) {
+          terminalUnack += buf.length - 1;
+          if (terminalUnack > AckBlkSize) {
+            ws.send(JSON.stringify({ type: 'ack', ack: terminalUnack }));
+            terminalUnack = 0;
+          }
+          return;
+        }
 
         // File transfer end signal: single byte [1] (same as frontend: data.length === 1)
         if (buf.length === 1) {
@@ -296,6 +464,8 @@ async function downloadFile(client, devid, group, remotePath, outputPath) {
     });
 
     writeFileSync(savePath, Buffer.concat(chunks));
+    await new Promise(resolve => setTimeout(resolve, 500));
+    sendTerminalCommand(ws, FileRestoreCommand);
     return { filename: savePath, received };
   } finally {
     ws.close();

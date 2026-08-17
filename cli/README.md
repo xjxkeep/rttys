@@ -42,7 +42,10 @@ my-mac         10.42.0.1  MacBook Local
 #### `exec` — Execute command on a device
 
 ```bash
-rttys-cli -s http://admin.andless.tech -p 'password' exec --id my-mac --cmd "ls /tmp"
+rttys-cli -s http://admin.andless.tech -p 'password' exec --id my-mac --cmd ls --arg /tmp
+
+# Shell syntax is opt-in
+rttys-cli -s http://admin.andless.tech -p 'password' exec --id my-mac --shell --cmd "dmesg | tail -50"
 ```
 
 | Flag | Short | Default | Description |
@@ -52,6 +55,8 @@ rttys-cli -s http://admin.andless.tech -p 'password' exec --id my-mac --cmd "ls 
 | `--user` | | `root` | Login username on the device |
 | `--group` | `-g` | | Device group |
 | `--wait` | | `30` | Timeout in seconds (0 = fire and forget) |
+| `--arg` | `-a` | | Argument passed to the executable; repeat as needed |
+| `--shell` | | `false` | Run `--cmd` through `/bin/sh -lc` |
 
 stdout and stderr are automatically decoded from base64. The exit code mirrors the remote command's exit code.
 

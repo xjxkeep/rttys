@@ -74,6 +74,15 @@ func main() {
 						Usage: "wait timeout in seconds (0=no wait)",
 						Value: 30,
 					},
+					&cli.StringSliceFlag{
+						Name:    "arg",
+						Aliases: []string{"a"},
+						Usage:   "argument passed to the executable (repeatable)",
+					},
+					&cli.BoolFlag{
+						Name:  "shell",
+						Usage: "run --cmd through /bin/sh -lc",
+					},
 				},
 			},
 			{
@@ -203,8 +212,18 @@ func execAction(_ context.Context, cmd *cli.Command) error {
 		return err
 	}
 
-	result, err := execCommand(server, password, cmd.String("id"), cmd.String("group"),
-		cmd.String("cmd"), cmd.String("user"), int(cmd.Int("wait")))
+	command := cmd.String("cmd")
+	params := cmd.StringSlice("arg")
+	if cmd.Bool("shell") {
+		if len(params) > 0 {
+			return fmt.Errorf("--arg cannot be combined with --shell")
+		}
+		params = []string{"-lc", command}
+		command = "/bin/sh"
+	}
+
+	result, err := execCommandArgs(server, password, cmd.String("id"), cmd.String("group"),
+		command, cmd.String("user"), params, int(cmd.Int("wait")))
 	if err != nil {
 		return err
 	}

@@ -184,6 +184,10 @@ func listGroups(server, password string) ([]string, error) {
 }
 
 func execCommand(server, password, devid, group, cmd, user string, wait int) (*ExecResult, error) {
+	return execCommandArgs(server, password, devid, group, cmd, user, nil, wait)
+}
+
+func execCommandArgs(server, password, devid, group, cmd, user string, params []string, wait int) (*ExecResult, error) {
 	c, err := newClientDirect(server, password)
 	if err != nil {
 		return nil, err
@@ -192,7 +196,7 @@ func execCommand(server, password, devid, group, cmd, user string, wait int) (*E
 	payload := map[string]any{
 		"cmd":      cmd,
 		"username": user,
-		"params":   []string{},
+		"params":   params,
 	}
 
 	path := fmt.Sprintf("/cmd/%s?group=%s&wait=%d", devid, group, wait)
@@ -226,11 +230,43 @@ func execCommand(server, password, devid, group, cmd, user string, wait int) (*E
 }
 
 const (
-	msgTypeFileData = 0x03
-	fileChunkSize   = 63 * 1024
+	msgTypeFileData      = 0x03
+	fileChunkSize        = 63 * 1024
+	terminalAckBlockSize = 4 * 1024
+	fileReadyMarker      = "\x1eRTTY_FILE_READY\x1f"
+	filePrepareCommand   = "stty -echo; printf '\\036RTTY_FILE_READY\\037'\r"
+	fileReceiveCommand   = "rtty -R\r"
+	fileRestoreCommand   = "stty echo\r"
 )
 
+type fileTransferOptions struct {
+	attempts         int
+	readyTimeout     time.Duration
+	handshakeTimeout time.Duration
+	retryDelay       time.Duration
+	finishDelay      time.Duration
+}
+
+var defaultFileTransferOptions = fileTransferOptions{
+	attempts:         3,
+	readyTimeout:     10 * time.Second,
+	handshakeTimeout: 30 * time.Second,
+	retryDelay:       time.Second,
+	finishDelay:      500 * time.Millisecond,
+}
+
+type wsMessageReader struct {
+	conn            *websocket.Conn
+	unacked         int
+	terminalTail    []byte
+	pendingFilename string
+}
+
 func uploadFile(server, password, devid, group, filePath string) (int64, error) {
+	return uploadFileWithOptions(server, password, devid, group, filePath, defaultFileTransferOptions)
+}
+
+func uploadFileWithOptions(server, password, devid, group, filePath string, opts fileTransferOptions) (int64, error) {
 	c, err := newClientDirect(server, password)
 	if err != nil {
 		return 0, err
@@ -251,21 +287,38 @@ func uploadFile(server, password, devid, group, filePath string) (int64, error) 
 		return 0, fmt.Errorf("file too large (max 4GB)")
 	}
 
-	conn, err := c.connectWS(devid, group)
-	if err != nil {
-		return 0, err
+	if opts.attempts < 1 {
+		opts.attempts = 1
+	}
+
+	var conn *websocket.Conn
+	var reader *wsMessageReader
+	var handshakeErr error
+
+	for attempt := 1; attempt <= opts.attempts; attempt++ {
+		conn, err = c.connectWS(devid, group)
+		if err == nil {
+			reader = &wsMessageReader{conn: conn}
+			err = prepareFileReceive(reader, opts)
+		}
+		if err == nil {
+			break
+		}
+
+		handshakeErr = err
+		if conn != nil {
+			conn.Close()
+			conn = nil
+		}
+		if attempt < opts.attempts {
+			time.Sleep(opts.retryDelay)
+		}
+	}
+
+	if conn == nil {
+		return 0, fmt.Errorf("prepare device file receiver after %d attempts: %w", opts.attempts, handshakeErr)
 	}
 	defer conn.Close()
-
-	termCmd := []byte{0}
-	termCmd = append(termCmd, []byte("rtty -R\r")...)
-	if err := conn.WriteMessage(websocket.BinaryMessage, termCmd); err != nil {
-		return 0, fmt.Errorf("send rtty -R: %w", err)
-	}
-
-	if err := waitForJSONMsg(conn, "recvfile", 10*time.Second); err != nil {
-		return 0, fmt.Errorf("waiting for device to accept file: %w", err)
-	}
 
 	fileInfo, _ := json.Marshal(map[string]any{
 		"type": "fileInfo",
@@ -274,6 +327,14 @@ func uploadFile(server, password, devid, group, filePath string) (int64, error) 
 	})
 	if err := conn.WriteMessage(websocket.TextMessage, fileInfo); err != nil {
 		return 0, fmt.Errorf("send fileInfo: %w", err)
+	}
+
+	if info.Size() == 0 {
+		if err := conn.WriteMessage(websocket.BinaryMessage, []byte{1, msgTypeFileData}); err != nil {
+			return 0, fmt.Errorf("finish empty file: %w", err)
+		}
+		finishFileReceive(reader, opts.finishDelay)
+		return 0, nil
 	}
 
 	buf := make([]byte, fileChunkSize)
@@ -295,7 +356,7 @@ func uploadFile(server, password, devid, group, filePath string) (int64, error) 
 			sent += int64(n)
 
 			if sent < fileSize {
-				if err := waitForJSONMsg(conn, "fileAck", 30*time.Second); err != nil {
+				if err := reader.waitForJSONMsg("fileAck", 30*time.Second); err != nil {
 					return sent, fmt.Errorf("waiting for ack: %w", err)
 				}
 			}
@@ -309,7 +370,47 @@ func uploadFile(server, password, devid, group, filePath string) (int64, error) 
 		}
 	}
 
+	finishFileReceive(reader, opts.finishDelay)
 	return sent, nil
+}
+
+func prepareFileReceive(reader *wsMessageReader, opts fileTransferOptions) error {
+	if err := reader.waitForShellPrompt(opts.readyTimeout); err != nil {
+		return fmt.Errorf("waiting for remote shell: %w", err)
+	}
+
+	if err := writeTerminalCommand(reader.conn, filePrepareCommand); err != nil {
+		return fmt.Errorf("prepare terminal: %w", err)
+	}
+
+	if err := reader.waitForTerminalMarker([]byte(fileReadyMarker), opts.readyTimeout); err != nil {
+		return fmt.Errorf("waiting for terminal readiness: %w", err)
+	}
+
+	if err := writeTerminalCommand(reader.conn, fileReceiveCommand); err != nil {
+		return fmt.Errorf("start device file receiver: %w", err)
+	}
+
+	if err := reader.waitForJSONMsg("recvfile", opts.handshakeTimeout); err != nil {
+		return fmt.Errorf("waiting for device to accept file: %w", err)
+	}
+
+	return nil
+}
+
+func finishFileReceive(reader *wsMessageReader, delay time.Duration) {
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+	_ = writeTerminalCommand(reader.conn, fileRestoreCommand)
+	_ = reader.flushTerminalAck()
+}
+
+func writeTerminalCommand(conn *websocket.Conn, command string) error {
+	msg := make([]byte, 1, len(command)+1)
+	msg[0] = 0
+	msg = append(msg, command...)
+	return conn.WriteMessage(websocket.BinaryMessage, msg)
 }
 
 func downloadFile(server, password, devid, group, remotePath, outputPath string) (string, int64, error) {
@@ -318,22 +419,13 @@ func downloadFile(server, password, devid, group, remotePath, outputPath string)
 		return "", 0, err
 	}
 
-	conn, err := c.connectWS(devid, group)
+	conn, reader, err := prepareFileSend(c, devid, group, remotePath, defaultFileTransferOptions)
 	if err != nil {
 		return "", 0, err
 	}
 	defer conn.Close()
 
-	termCmd := []byte{0}
-	termCmd = append(termCmd, []byte(fmt.Sprintf("rtty -S %s\r", remotePath))...)
-	if err := conn.WriteMessage(websocket.BinaryMessage, termCmd); err != nil {
-		return "", 0, fmt.Errorf("send rtty -S: %w", err)
-	}
-
-	filename, err := waitForSendFile(conn, 10*time.Second)
-	if err != nil {
-		return "", 0, fmt.Errorf("waiting for device to send file: %w", err)
-	}
+	filename := reader.pendingFilename
 
 	ack, _ := json.Marshal(map[string]string{"type": "fileAck"})
 	if err := conn.WriteMessage(websocket.TextMessage, ack); err != nil {
@@ -367,6 +459,9 @@ func downloadFile(server, password, devid, group, remotePath, outputPath string)
 		}
 
 		if data[0] == 0 {
+			if _, err := reader.handleBinary(data); err != nil {
+				return filename, received, fmt.Errorf("acknowledge terminal data: %w", err)
+			}
 			continue
 		}
 
@@ -386,21 +481,75 @@ func downloadFile(server, password, devid, group, remotePath, outputPath string)
 		}
 	}
 
+	finishFileReceive(reader, defaultFileTransferOptions.finishDelay)
 	return filename, received, nil
+}
+
+func prepareFileSend(c *client, devid, group, remotePath string, opts fileTransferOptions) (*websocket.Conn, *wsMessageReader, error) {
+	if opts.attempts < 1 {
+		opts.attempts = 1
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= opts.attempts; attempt++ {
+		conn, err := c.connectWS(devid, group)
+		if err == nil {
+			reader := &wsMessageReader{conn: conn}
+			err = reader.waitForShellPrompt(opts.readyTimeout)
+			if err == nil {
+				err = writeTerminalCommand(conn, filePrepareCommand)
+			}
+			if err == nil {
+				err = reader.waitForTerminalMarker([]byte(fileReadyMarker), opts.readyTimeout)
+			}
+			if err == nil {
+				command := fmt.Sprintf("rtty -S %s\r", shellQuote(remotePath))
+				err = writeTerminalCommand(conn, command)
+			}
+			if err == nil {
+				err = reader.waitForSendFile(opts.handshakeTimeout)
+			}
+			if err == nil {
+				return conn, reader, nil
+			}
+			conn.Close()
+		}
+
+		lastErr = err
+		if attempt < opts.attempts {
+			time.Sleep(opts.retryDelay)
+		}
+	}
+
+	return nil, nil, fmt.Errorf("prepare device file sender after %d attempts: %w", opts.attempts, lastErr)
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
 // --- WebSocket helpers ---
 
-func waitForJSONMsg(conn *websocket.Conn, msgType string, timeout time.Duration) error {
-	conn.SetReadDeadline(time.Now().Add(timeout))
-	defer conn.SetReadDeadline(time.Time{})
+func (r *wsMessageReader) waitForJSONMsg(msgType string, timeout time.Duration) error {
+	r.conn.SetReadDeadline(time.Now().Add(timeout))
+	defer r.conn.SetReadDeadline(time.Time{})
 
 	for {
-		typ, data, err := conn.ReadMessage()
+		typ, data, err := r.conn.ReadMessage()
 		if err != nil {
 			return err
 		}
 
+		if typ == websocket.BinaryMessage {
+			payload, err := r.handleBinary(data)
+			if err != nil {
+				return err
+			}
+			if err := r.detectTerminalTransferError(payload); err != nil {
+				return err
+			}
+			continue
+		}
 		if typ != websocket.TextMessage {
 			continue
 		}
@@ -418,14 +567,154 @@ func waitForJSONMsg(conn *websocket.Conn, msgType string, timeout time.Duration)
 	}
 }
 
-func waitForSendFile(conn *websocket.Conn, timeout time.Duration) (string, error) {
-	conn.SetReadDeadline(time.Now().Add(timeout))
-	defer conn.SetReadDeadline(time.Time{})
+func (r *wsMessageReader) waitForTerminalMarker(marker []byte, timeout time.Duration) error {
+	r.conn.SetReadDeadline(time.Now().Add(timeout))
+	defer r.conn.SetReadDeadline(time.Time{})
+
+	window := make([]byte, 0, len(marker)*2)
+	for {
+		typ, data, err := r.conn.ReadMessage()
+		if err != nil {
+			if len(window) > 0 {
+				return fmt.Errorf("%w (last terminal output: %q)", err, window)
+			}
+			return err
+		}
+		if typ != websocket.BinaryMessage {
+			continue
+		}
+
+		payload, err := r.handleBinary(data)
+		if err != nil {
+			return err
+		}
+		if len(payload) == 0 {
+			continue
+		}
+
+		window = append(window, payload...)
+		if bytes.Contains(window, marker) {
+			return nil
+		}
+		if keep := len(marker) - 1; len(window) > keep {
+			window = append(window[:0], window[len(window)-keep:]...)
+		}
+	}
+}
+
+func (r *wsMessageReader) waitForShellPrompt(timeout time.Duration) error {
+	r.conn.SetReadDeadline(time.Now().Add(timeout))
+	defer r.conn.SetReadDeadline(time.Time{})
+
+	window := make([]byte, 0, 512)
+	for {
+		typ, data, err := r.conn.ReadMessage()
+		if err != nil {
+			if len(window) > 0 {
+				return fmt.Errorf("%w (last terminal output: %q)", err, window)
+			}
+			return err
+		}
+		if typ != websocket.BinaryMessage {
+			continue
+		}
+
+		payload, err := r.handleBinary(data)
+		if err != nil {
+			return err
+		}
+		window = append(window, payload...)
+		if hasShellPrompt(window) {
+			return nil
+		}
+		if len(window) > 512 {
+			window = append(window[:0], window[len(window)-512:]...)
+		}
+	}
+}
+
+func hasShellPrompt(data []byte) bool {
+	trimmed := bytes.TrimRight(data, "\r\n")
+	return bytes.HasSuffix(trimmed, []byte("# ")) ||
+		bytes.HasSuffix(trimmed, []byte("$ ")) ||
+		bytes.HasSuffix(trimmed, []byte("> "))
+}
+
+func (r *wsMessageReader) handleBinary(data []byte) ([]byte, error) {
+	if len(data) == 0 || data[0] != 0 {
+		return nil, nil
+	}
+
+	payload := data[1:]
+	r.unacked += len(payload)
+	if r.unacked > terminalAckBlockSize {
+		if err := r.flushTerminalAck(); err != nil {
+			return nil, err
+		}
+	}
+	return payload, nil
+}
+
+func (r *wsMessageReader) flushTerminalAck() error {
+	if r.unacked == 0 {
+		return nil
+	}
+	msg, _ := json.Marshal(map[string]any{"type": "ack", "ack": r.unacked})
+	if err := r.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+		return err
+	}
+	r.unacked = 0
+	return nil
+}
+
+func (r *wsMessageReader) detectTerminalTransferError(payload []byte) error {
+	if len(payload) == 0 {
+		return nil
+	}
+
+	const tailLimit = 256
+	combined := append(append([]byte(nil), r.terminalTail...), payload...)
+	errors := []struct {
+		text []byte
+		err  string
+	}{
+		{[]byte("The file already exists"), "remote file already exists"},
+		{[]byte("No enough space"), "remote device has insufficient space"},
+		{[]byte("Rtty is busy to transfer file"), "remote device is busy transferring another file"},
+		{[]byte("Permission denied"), "remote destination is not writable"},
+	}
+	for _, candidate := range errors {
+		if bytes.Contains(combined, candidate.text) {
+			return fmt.Errorf("%s", candidate.err)
+		}
+	}
+
+	if len(combined) > tailLimit {
+		combined = combined[len(combined)-tailLimit:]
+	}
+	r.terminalTail = append(r.terminalTail[:0], combined...)
+	return nil
+}
+
+func (r *wsMessageReader) waitForSendFile(timeout time.Duration) error {
+	r.conn.SetReadDeadline(time.Now().Add(timeout))
+	defer r.conn.SetReadDeadline(time.Time{})
 
 	for {
-		typ, data, err := conn.ReadMessage()
+		typ, data, err := r.conn.ReadMessage()
 		if err != nil {
-			return "", err
+			return err
+		}
+
+		if typ == websocket.BinaryMessage {
+			payload, err := r.handleBinary(data)
+			if err != nil {
+				return err
+			}
+			if err := r.detectTerminalTransferError(payload); err != nil {
+				return err
+			}
+			continue
 		}
 
 		if typ != websocket.TextMessage {
@@ -441,7 +730,8 @@ func waitForSendFile(conn *websocket.Conn, timeout time.Duration) (string, error
 		}
 
 		if msg.Type == "sendfile" {
-			return msg.Name, nil
+			r.pendingFilename = msg.Name
+			return nil
 		}
 	}
 }
