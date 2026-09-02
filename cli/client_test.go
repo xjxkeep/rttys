@@ -213,6 +213,62 @@ func TestDownloadFileWaitsForShellAndQuotesRemotePath(t *testing.T) {
 	}
 }
 
+func TestExecCommandWaitsForTemporaryOfflineDevice(t *testing.T) {
+	oldWindow := commandOfflineRetryWindow
+	oldInterval := commandOfflineRetryInterval
+	commandOfflineRetryWindow = time.Second
+	commandOfflineRetryInterval = time.Millisecond
+	defer func() {
+		commandOfflineRetryWindow = oldWindow
+		commandOfflineRetryInterval = oldInterval
+	}()
+
+	var attempts atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/signin", func(w http.ResponseWriter, _ *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "session", Value: "test"})
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/cmd/device", func(w http.ResponseWriter, _ *http.Request) {
+		if attempts.Add(1) < 3 {
+			_ = json.NewEncoder(w).Encode(ExecResult{Err: rttyCommandErrOffline, Msg: "device offline"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(ExecResult{Err: 0, Code: 0})
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	result, err := execCommand(server.URL, "password", "device", "default", "true", "root", 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Code != 0 || attempts.Load() != 3 {
+		t.Fatalf("result=%+v attempts=%d", result, attempts.Load())
+	}
+}
+
+func TestExecCommandDoesNotRetryAmbiguousHTTPFailure(t *testing.T) {
+	var attempts atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/signin", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/cmd/device", func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		http.Error(w, "gateway failure", http.StatusBadGateway)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	if _, err := execCommand(server.URL, "password", "device", "default", "dangerous-command", "root", 30); err == nil {
+		t.Fatal("expected HTTP failure")
+	}
+	if attempts.Load() != 1 {
+		t.Fatalf("attempts=%d want=1", attempts.Load())
+	}
+}
+
 func newUploadTestServer(t *testing.T, session func(*websocket.Conn) error, results chan<- error) *httptest.Server {
 	t.Helper()
 	upgrader := websocket.Upgrader{}

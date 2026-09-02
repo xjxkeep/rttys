@@ -6,7 +6,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -21,9 +20,7 @@ import (
 )
 
 type CommandReq struct {
-	cancel context.CancelFunc
-	acked  bool
-	c      *gin.Context
+	result chan map[string]any
 }
 
 type CommandReqInfo struct {
@@ -50,15 +47,25 @@ var cmdErrMsg = map[int]string{
 }
 
 func (dev *Device) handleCmdReq(c *gin.Context, info *CommandReqInfo) {
-	ctx, cancel := context.WithCancel(dev.ctx)
-	defer cancel()
+	token := utils.GenUniqueID()
+	waitTime := CommandTimeout
 
-	req := &CommandReq{
-		cancel: cancel,
-		c:      c,
+	if wait := c.Query("wait"); wait != "" {
+		if parsed, err := strconv.Atoi(wait); err == nil {
+			waitTime = parsed
+		}
 	}
 
-	token := utils.GenUniqueID()
+	if waitTime < 0 || waitTime > CommandTimeout {
+		waitTime = CommandTimeout
+	}
+
+	var req *CommandReq
+	if waitTime != 0 {
+		req = &CommandReq{result: make(chan map[string]any, 1)}
+		dev.commands.Store(token, req)
+		defer dev.commands.Delete(token)
+	}
 
 	msg := bytebufferpool.Get()
 	defer bytebufferpool.Put(msg)
@@ -81,38 +88,25 @@ func (dev *Device) handleCmdReq(c *gin.Context, info *CommandReqInfo) {
 		return
 	}
 
-	waitTime := CommandTimeout
-
-	wait := c.Query("wait")
-	if wait != "" {
-		waitTime, _ = strconv.Atoi(wait)
-	}
-
 	if waitTime == 0 {
 		c.Status(http.StatusOK)
 		return
 	}
 
-	dev.commands.Store(token, req)
-
-	if waitTime < 0 || waitTime > CommandTimeout {
-		waitTime = CommandTimeout
-	}
-
 	tmr := time.NewTimer(time.Second * time.Duration(waitTime))
+	defer tmr.Stop()
 
 	log.Debug().Msgf("wait for cmd response for device '%s', token '%s', waitTime %ds", dev.id, token, waitTime)
 
 	select {
+	case attrs := <-req.result:
+		c.JSON(http.StatusOK, attrs)
 	case <-tmr.C:
 		cmdErrResp(c, rttyCmdErrTimeout)
-	case <-ctx.Done():
-	}
-
-	dev.commands.Delete(token)
-
-	if !req.acked {
+	case <-dev.ctx.Done():
 		cmdErrResp(c, rttyCmdErrOffline)
+	case <-c.Request.Context().Done():
+		return
 	}
 
 	log.Debug().Msgf("handle cmd request for device '%s', token '%s' done", dev.id, token)

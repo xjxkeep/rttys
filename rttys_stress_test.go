@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -30,6 +31,10 @@ const (
 
 // Run rtty clients with "-f username"
 func TestRttysStress(t *testing.T) {
+	if os.Getenv("RTTYS_STRESS_TEST") != "1" {
+		t.Skip("set RTTYS_STRESS_TEST=1 to run the live device stress test")
+	}
+
 	duration := 10 * time.Minute
 
 	timeoutFlag := flag.Lookup("test.timeout")

@@ -84,10 +84,19 @@ func (srv *RttyServer) AddDevice(dev *Device) bool {
 
 	g := srv.GetGroup(dev.group, true)
 
-	if _, loaded := g.devices.LoadOrStore(dev.id, dev); loaded {
-		return false
+	if value, loaded := g.devices.Load(dev.id); loaded {
+		previous := value.(*Device)
+		if previous.token != dev.token {
+			return false
+		}
+
+		g.devices.Store(dev.id, dev)
+		go previous.Close(srv)
+		log.Warn().Msgf("device '%s' reconnected; replaced the previous connection", dev.id)
+		return true
 	}
 
+	g.devices.Store(dev.id, dev)
 	g.count.Add(1)
 
 	return true

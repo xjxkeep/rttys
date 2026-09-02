@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -44,6 +45,41 @@ type client struct {
 	http     *http.Client
 }
 
+const (
+	httpRequestTimeout        = 45 * time.Second
+	httpDialTimeout           = 10 * time.Second
+	httpTLSHandshakeTimeout   = 10 * time.Second
+	websocketHandshakeTimeout = 10 * time.Second
+	websocketWriteTimeout     = 15 * time.Second
+	websocketReadLimit        = 2 * 1024 * 1024
+	rttyCommandErrOffline     = 1002
+)
+
+var (
+	commandOfflineRetryWindow   = 15 * time.Second
+	commandOfflineRetryInterval = 500 * time.Millisecond
+
+	sharedDialer = &net.Dialer{
+		Timeout:   httpDialTimeout,
+		KeepAlive: 30 * time.Second,
+	}
+	sharedHTTPTransport = &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           sharedDialer.DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          32,
+		MaxIdleConnsPerHost:   8,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   httpTLSHandshakeTimeout,
+		ExpectContinueTimeout: time.Second,
+	}
+	sharedWebSocketDialer = &websocket.Dialer{
+		Proxy:            http.ProxyFromEnvironment,
+		NetDialContext:   sharedDialer.DialContext,
+		HandshakeTimeout: websocketHandshakeTimeout,
+	}
+)
+
 func newClientDirect(server, password string) (*client, error) {
 	jar, err := cookiejar.New(nil)
 	if err != nil {
@@ -53,7 +89,11 @@ func newClientDirect(server, password string) (*client, error) {
 	c := &client{
 		baseURL:  strings.TrimRight(server, "/"),
 		password: password,
-		http:     &http.Client{Jar: jar},
+		http: &http.Client{
+			Jar:       jar,
+			Transport: sharedHTTPTransport,
+			Timeout:   httpRequestTimeout,
+		},
 	}
 
 	if err := c.signin(); err != nil {
@@ -64,7 +104,10 @@ func newClientDirect(server, password string) (*client, error) {
 }
 
 func (c *client) signin() error {
-	body, _ := json.Marshal(map[string]string{"password": c.password})
+	body, err := json.Marshal(map[string]string{"password": c.password})
+	if err != nil {
+		return err
+	}
 	resp, err := c.http.Post(c.baseURL+"/signin", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -91,12 +134,19 @@ func (c *client) get(path string) ([]byte, error) {
 }
 
 func (c *client) postJSON(path string, payload any) ([]byte, error) {
-	body, _ := json.Marshal(payload)
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
 	resp, err := c.http.Post(c.baseURL+path, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("request failed (status %d)", resp.StatusCode)
+	}
 
 	return io.ReadAll(resp.Body)
 }
@@ -112,7 +162,8 @@ func (c *client) connectWS(devid, group string) (*websocket.Conn, error) {
 		scheme = "wss"
 	}
 
-	wsURL := fmt.Sprintf("%s://%s/connect/%s?group=%s", scheme, u.Host, devid, group)
+	wsURL := fmt.Sprintf("%s://%s/connect/%s?group=%s", scheme, u.Host,
+		url.PathEscape(devid), url.QueryEscape(group))
 
 	parsedURL, _ := url.Parse(c.baseURL)
 	cookies := c.http.Jar.Cookies(parsedURL)
@@ -121,7 +172,7 @@ func (c *client) connectWS(devid, group string) (*websocket.Conn, error) {
 		header.Add("Cookie", cookie.String())
 	}
 
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+	conn, _, err := sharedWebSocketDialer.Dial(wsURL, header)
 	if err != nil {
 		return nil, fmt.Errorf("websocket connect failed: %w", err)
 	}
@@ -138,6 +189,7 @@ func (c *client) connectWS(devid, group string) (*websocket.Conn, error) {
 	}
 	if err := json.Unmarshal(data, &msg); err == nil && msg.Type == "login" {
 		conn.SetReadDeadline(time.Time{})
+		conn.SetReadLimit(websocketReadLimit)
 		return conn, nil
 	}
 
@@ -199,18 +251,32 @@ func execCommandArgs(server, password, devid, group, cmd, user string, params []
 		"params":   params,
 	}
 
-	path := fmt.Sprintf("/cmd/%s?group=%s&wait=%d", devid, group, wait)
-	data, err := c.postJSON(path, payload)
-	if err != nil {
-		return nil, err
-	}
+	path := fmt.Sprintf("/cmd/%s?group=%s&wait=%d", url.PathEscape(devid),
+		url.QueryEscape(group), wait)
+	offlineDeadline := time.Now().Add(commandOfflineRetryWindow)
 
 	var result ExecResult
-	if err := json.Unmarshal(data, &result); err != nil {
-		return nil, fmt.Errorf("unexpected response: %s", string(data))
+	for {
+		data, err := c.postJSON(path, payload)
+		if err != nil {
+			return nil, err
+		}
+
+		result = ExecResult{}
+		if err := json.Unmarshal(data, &result); err != nil {
+			return nil, fmt.Errorf("unexpected response: %s", string(data))
+		}
+
+		if result.Err != rttyCommandErrOffline || !time.Now().Before(offlineDeadline) {
+			break
+		}
+		time.Sleep(commandOfflineRetryInterval)
 	}
 
 	if result.Err != 0 {
+		if result.Err == rttyCommandErrOffline {
+			return &result, fmt.Errorf("command error: device remained offline for %s", commandOfflineRetryWindow)
+		}
 		return &result, fmt.Errorf("command error: %s", result.Msg)
 	}
 
@@ -325,12 +391,12 @@ func uploadFileWithOptions(server, password, devid, group, filePath string, opts
 		"size": info.Size(),
 		"name": filepath.Base(filePath),
 	})
-	if err := conn.WriteMessage(websocket.TextMessage, fileInfo); err != nil {
+	if err := writeWebSocketMessage(conn, websocket.TextMessage, fileInfo); err != nil {
 		return 0, fmt.Errorf("send fileInfo: %w", err)
 	}
 
 	if info.Size() == 0 {
-		if err := conn.WriteMessage(websocket.BinaryMessage, []byte{1, msgTypeFileData}); err != nil {
+		if err := writeWebSocketMessage(conn, websocket.BinaryMessage, []byte{1, msgTypeFileData}); err != nil {
 			return 0, fmt.Errorf("finish empty file: %w", err)
 		}
 		finishFileReceive(reader, opts.finishDelay)
@@ -349,7 +415,7 @@ func uploadFileWithOptions(server, password, devid, group, filePath string, opts
 			msg[1] = msgTypeFileData
 			copy(msg[2:], buf[:n])
 
-			if err := conn.WriteMessage(websocket.BinaryMessage, msg); err != nil {
+			if err := writeWebSocketMessage(conn, websocket.BinaryMessage, msg); err != nil {
 				return sent, fmt.Errorf("send file data: %w", err)
 			}
 
@@ -410,7 +476,7 @@ func writeTerminalCommand(conn *websocket.Conn, command string) error {
 	msg := make([]byte, 1, len(command)+1)
 	msg[0] = 0
 	msg = append(msg, command...)
-	return conn.WriteMessage(websocket.BinaryMessage, msg)
+	return writeWebSocketMessage(conn, websocket.BinaryMessage, msg)
 }
 
 func downloadFile(server, password, devid, group, remotePath, outputPath string) (string, int64, error) {
@@ -428,7 +494,7 @@ func downloadFile(server, password, devid, group, remotePath, outputPath string)
 	filename := reader.pendingFilename
 
 	ack, _ := json.Marshal(map[string]string{"type": "fileAck"})
-	if err := conn.WriteMessage(websocket.TextMessage, ack); err != nil {
+	if err := writeWebSocketMessage(conn, websocket.TextMessage, ack); err != nil {
 		return "", 0, fmt.Errorf("send ack: %w", err)
 	}
 
@@ -476,7 +542,7 @@ func downloadFile(server, password, devid, group, remotePath, outputPath string)
 
 		received += int64(len(chunk))
 
-		if err := conn.WriteMessage(websocket.TextMessage, ack); err != nil {
+		if err := writeWebSocketMessage(conn, websocket.TextMessage, ack); err != nil {
 			return filename, received, fmt.Errorf("send ack: %w", err)
 		}
 	}
@@ -660,11 +726,19 @@ func (r *wsMessageReader) flushTerminalAck() error {
 		return nil
 	}
 	msg, _ := json.Marshal(map[string]any{"type": "ack", "ack": r.unacked})
-	if err := r.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+	if err := writeWebSocketMessage(r.conn, websocket.TextMessage, msg); err != nil {
 		return err
 	}
 	r.unacked = 0
 	return nil
+}
+
+func writeWebSocketMessage(conn *websocket.Conn, messageType int, data []byte) error {
+	if err := conn.SetWriteDeadline(time.Now().Add(websocketWriteTimeout)); err != nil {
+		return err
+	}
+	defer conn.SetWriteDeadline(time.Time{})
+	return conn.WriteMessage(messageType, data)
 }
 
 func (r *wsMessageReader) detectTerminalTransferError(payload []byte) error {
